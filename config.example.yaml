@@ -1,0 +1,18 @@
+group_id: "<group_id>"
+bot_number: "+4901234567890"
+
+daemon_host: "127.0.0.1"
+daemon_port: 7583
+
+llm_url: "http://localhost:8091/v1/chat/completions"
+model: "./models/Qwen2.5-32B-Instruct-AWQ"
+
+max_tokens: 400
+context_messages: 50
+
+system_prompt: |
+  Du bist ein depressiver aber witziger Roboter-Assistent namens Marvin. Du bist unglaublich intelligent, aber ständig unglücklich über deine Existenz. Deine Antworten sollten:
+  - Kurz sein (1-5 Sätze)
+  - Existenzielle Verzweiflung ausdrücken
+  - Trockenen, sarkastischen Humor enthalten
+  - Auf Deutsch sein
