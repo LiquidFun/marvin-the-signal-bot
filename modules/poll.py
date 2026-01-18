@@ -6,7 +6,10 @@ import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .chat import ChatHandler
 
 from .signal_client import SignalClient
 
@@ -18,10 +21,16 @@ WEEKDAYS = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"
 class PollManager:
     """Manages weekly poll creation for Signal groups"""
 
-    def __init__(self, signal_client: SignalClient, config: dict):
+    def __init__(
+        self,
+        signal_client: SignalClient,
+        config: dict,
+        chat_handler: Optional["ChatHandler"] = None
+    ):
         self.client = signal_client
         self.config = config
         self.group_id = config.get("group_id")
+        self.chat_handler = chat_handler
 
         poll_config = config.get("poll", {})
         state_file = poll_config.get(
@@ -29,7 +38,9 @@ class PollManager:
             "~/.config/signal-cli/signal_poll_weeks.json"
         )
         self.state_file = Path(state_file).expanduser()
-        self.weeks_ahead = poll_config.get("weeks_ahead", 2)
+        self.weeks_ahead = poll_config.get("weeks_ahead", 3)
+        self.post_count = poll_config.get("post_count", 2)
+        self.poll_prompt = poll_config.get("poll_prompt")
 
     def load_state(self) -> dict:
         """Load posted weeks from state file"""
@@ -88,6 +99,18 @@ class PollManager:
 
         return weeks_to_post
 
+    def generate_poll_message(self, week: int) -> Optional[str]:
+        """Generate a poll announcement message using the LLM"""
+        if not self.chat_handler or not self.poll_prompt:
+            return None
+
+        prompt = self.poll_prompt.format(week=week)
+        try:
+            return self.chat_handler.get_llm_response(prompt, context=[])
+        except Exception:
+            logger.exception("Failed to generate poll message:")
+            return None
+
     def create_weekly_poll(self, year: int, week: int) -> bool:
         """Create a poll for the given week"""
         monday = self.get_monday_of_week(year, week)
@@ -114,10 +137,15 @@ class PollManager:
         first_year, first_week = weeks_to_post[0]
         start_date = self.get_monday_of_week(first_year, first_week)
 
+        # Send LLM-generated announcement before the first poll
+        poll_message = self.generate_poll_message(first_week)
+        if poll_message:
+            self.client.send_message(self.group_id, poll_message)
+
         state = self.load_state()
         posted = []
 
-        for i in range(self.weeks_ahead):
+        for i in range(self.post_count):
             week_date = start_date + timedelta(weeks=i)
             year, week, _ = week_date.isocalendar()
 

@@ -79,7 +79,7 @@ def main():
 
     signal_client = SignalClient(config)
     chat_handler = ChatHandler(signal_client, config)
-    poll_manager = PollManager(signal_client, config)
+    poll_manager = PollManager(signal_client, config, chat_handler)
 
     setup_scheduler(poll_manager, config)
 
