@@ -1,2 +1,3 @@
 config.yaml
 message_history.json
+__pycache__

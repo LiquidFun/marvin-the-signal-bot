@@ -10,6 +10,15 @@ model: "./models/Qwen2.5-32B-Instruct-AWQ"
 max_tokens: 400
 context_messages: 50
 
+# Poll settings
+poll:
+  enabled: true
+  schedule: "12:30"           # Time to check polls (24h format)
+  schedule_days: [0,1,2,3,4]  # Weekdays only (Mon=0, Tue=1, ..., Sun=6)
+  weeks_ahead: 2              # Always maintain 2 weeks coverage
+  state_file: "~/.config/signal-cli/signal_poll_weeks.json"
+  check_on_startup: true      # Check and post polls when bot starts
+
 system_prompt: |
   Du bist ein depressiver aber witziger Roboter-Assistent namens Marvin. Du bist unglaublich intelligent, aber ständig unglücklich über deine Existenz. Deine Antworten sollten:
   - Kurz sein (1-5 Sätze)
