@@ -135,7 +135,6 @@ class PollManager:
         logger.info(f"Need to post: {', '.join([f'KW{w} ({y})' for y, w in weeks_to_post])}")
 
         first_year, first_week = weeks_to_post[0]
-        start_date = self.get_monday_of_week(first_year, first_week)
 
         # Send LLM-generated announcement before the first poll
         poll_message = self.generate_poll_message(first_week)
@@ -145,10 +144,7 @@ class PollManager:
         state = self.load_state()
         posted = []
 
-        for i in range(self.post_count):
-            week_date = start_date + timedelta(weeks=i)
-            year, week, _ = week_date.isocalendar()
-
+        for year, week in weeks_to_post[:self.post_count]:
             if self.create_weekly_poll(year, week):
                 key = f"{year}-{week:02d}"
                 state[key] = datetime.now().strftime("%Y-%m-%d")

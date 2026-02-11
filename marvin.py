@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script --with schedule
 """
 Marvin - Signal Bot Orchestrator
 Coordinates chat responses and poll scheduling
@@ -92,7 +92,7 @@ def main():
         logger.info("Running initial poll check...")
         poll_manager.check_and_post_polls()
 
-    chat_handler.run(scheduler_callback=schedule.run_pending)
+    chat_handler.run()
 
     return 0
 

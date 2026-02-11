@@ -6,7 +6,7 @@ import json
 import os
 import time
 import logging
-from typing import Set, Optional, List, Dict, Callable
+from typing import Set, Optional, List, Dict
 from collections import deque
 from datetime import datetime
 
@@ -139,7 +139,7 @@ class ChatHandler:
             sender = envelope.get("source") or envelope.get("sourceNumber")
             message_id = f"{sender}_{timestamp}"
 
-            message_text = data_message.get("message", "").strip()
+            message_text = (data_message.get("message") or "").strip()
             message_text = message_text.replace("\ufffc ", "")
             sender_name = self.get_sender_name(envelope)
 
@@ -177,7 +177,7 @@ class ChatHandler:
         except Exception:
             logger.exception("Error processing message:")
 
-    def run(self, scheduler_callback: Optional[Callable] = None):
+    def run(self):
         """Main loop - listen for messages and run scheduler"""
         logger.info("=" * 60)
         logger.info("Marvin Bot Starting")
@@ -215,9 +215,6 @@ class ChatHandler:
 
                             except json.JSONDecodeError:
                                 logger.warning(f"Failed to parse JSON: {line[:100]}")
-
-                    if scheduler_callback:
-                        scheduler_callback()
 
                 except Exception:
                     logger.exception("Error receiving message:")
