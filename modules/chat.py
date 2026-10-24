@@ -242,6 +242,11 @@ class ChatHandler:
                     continue
 
                 params = message.get("params") or {}
+                # Messages for a subscribeReceive subscription come wrapped as
+                # {"subscription": n, "result": {"envelope": ...}}; only the
+                # daemon's own on-start subscription sends them bare.
+                if isinstance(params, dict) and isinstance(params.get("result"), dict):
+                    params = params["result"]
                 if message.get("id") == "subscribe":
                     # The daemon runs in manual receive mode: without a
                     # subscription nothing arrives, and votes go unrecorded.
@@ -250,3 +255,6 @@ class ChatHandler:
                     logger.info(f"Subscribed: {message.get('result')}")
                 elif isinstance(params, dict) and "envelope" in params:
                     self.process_message(params["envelope"])
+                elif message.get("method") == "receive":
+                    # Never drop these silently: that is how votes went missing
+                    logger.warning(f"Unrecognised receive notification: {str(message)[:200]}")

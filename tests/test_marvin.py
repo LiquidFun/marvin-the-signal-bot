@@ -147,3 +147,28 @@ def test_failed_subscription_reconnects(client, config, tmp_path):
 
     with pytest.raises(ConnectionError, match="nope"):
         handler.listen(Sock())
+
+
+@pytest.mark.parametrize("wrap", [
+    lambda env: {"subscription": 0, "result": {"envelope": env, "account": "+49"}},  # subscribeReceive
+    lambda env: {"envelope": env, "account": "+49"},                                 # daemon on-start mode
+])
+def test_listener_reads_both_notification_shapes(client, config, tmp_path, wrap):
+    """In manual receive mode every message is wrapped; reading only the bare
+    shape silently ignored every vote"""
+    import json
+    config.update(bot_number="+49", llm_url="http://llm", reply_to_mentions=False,
+                  history_file=str(tmp_path / "h.json"))
+    config["poll"]["votes_file"] = str(tmp_path / "votes.jsonl")
+    handler = ChatHandler(client, config)
+    envelope = {"sourceUuid": "u1", "dataMessage": {"pollVote": {
+        "targetSentTimestamp": 42, "optionIndexes": [5], "voteCount": 3}}}
+    notification = {"jsonrpc": "2.0", "method": "receive", "params": wrap(envelope)}
+
+    class Sock:
+        chunks = [json.dumps(notification).encode() + b"\n"]
+        def recv(self, n):
+            return self.chunks.pop(0) if self.chunks else b""
+
+    handler.listen(Sock())
+    assert handler.votes.tally(42) == {5: 1}
