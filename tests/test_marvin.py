@@ -106,3 +106,44 @@ def test_broken_config_still_alerts(run, client, config):
     assert code == 1
     assert "state_file" in admin_messages(client)[0]
     assert pings == ["https://hc.example/abc/fail"]
+
+
+def test_listener_records_votes_without_storing_chat(client, config, tmp_path):
+    config.update(bot_number="+49", llm_url="http://llm", reply_to_mentions=False,
+                  history_file=str(tmp_path / "history.json"))
+    config["poll"]["votes_file"] = str(tmp_path / "votes.jsonl")
+    handler = ChatHandler(client, config)
+    vote = {"sourceUuid": "u1", "dataMessage": {"groupInfo": {"groupId": "x"}, "pollVote": {
+        "targetSentTimestamp": 42, "optionIndexes": [1, 3], "voteCount": 1}}}
+    chat = {"sourceUuid": "u1", "dataMessage": {"groupInfo": {"groupId": config["group_id"]}, "message": "hi"}}
+    handler.process_message(vote)
+    handler.process_message(chat)
+    assert handler.votes.tally(42) == {1: 1, 3: 1}
+    assert not (tmp_path / "history.json").exists()
+    assert client.messages == []
+
+
+def test_offer_problems_alert_the_admin(client, config, monkeypatch, tmp_path):
+    monkeypatch.setattr(marvin, "SignalClient", lambda config: client)
+    config["poll"]["votes_file"] = str(tmp_path / "votes.jsonl")
+    config["offer"] = {"state_file": str(tmp_path / "offers.log")}
+    assert marvin.run_offer(config, dry_run=False) == 1  # no poll for next week
+    assert "keine Umfrage" in admin_messages(client)[0]
+    client.messages.clear()
+    assert marvin.run_offer(config, dry_run=False) == 0
+    assert client.messages == []
+
+
+def test_failed_subscription_reconnects(client, config, tmp_path):
+    """In manual receive mode nothing arrives without a subscription"""
+    import json
+    config.update(bot_number="+49", llm_url="http://llm", history_file=str(tmp_path / "h.json"))
+    handler = ChatHandler(client, config)
+
+    class Sock:
+        chunks = [json.dumps({"id": "subscribe", "error": {"message": "nope"}}).encode() + b"\n"]
+        def recv(self, n):
+            return self.chunks.pop(0) if self.chunks else b""
+
+    with pytest.raises(ConnectionError, match="nope"):
+        handler.listen(Sock())

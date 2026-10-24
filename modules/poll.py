@@ -36,8 +36,9 @@ DEFAULT_ANNOUNCEMENT = (
     "nach einem Gegnerteam suchen."
 )
 
-# State log statuses. Only POSTED counts as done; only UNSENT may be retried.
-POSTED, SENDING, UNSENT, ERROR = "posted", "sending", "unsent", "error"
+# State log statuses. Only POSTED (and SKIPPED, for things deliberately not
+# sent) count as done; only UNSENT may be retried.
+POSTED, SENDING, UNSENT, ERROR, SKIPPED = "posted", "sending", "unsent", "error", "skipped"
 
 
 def week_key(monday: date) -> str:
@@ -75,7 +76,8 @@ def undelivered(results: List[dict]) -> str:
     return f"{len(failed)}/{len(results)} ({', '.join(sorted(set(failed)))})"
 
 
-STATE_LINE = re.compile(r"(\d{4}-W\d{2})\s+(posted|sending|unsent|error)(?:\s+(.*))?")
+STATE_LINE = re.compile(r"(\d{4}-W\d{2})\s+(posted|sending|unsent|error|skipped)(?:\s+(.*))?")
+SENT_TIMESTAMP = re.compile(r"\bts=(\d+)\b")
 
 
 class StateLog:
@@ -172,6 +174,20 @@ class PollManager:
         self.retry_delay = poll_config.get("retry_delay", 60)
         self.state = StateLog(Path(poll_config["state_file"]).expanduser())
         self.sleep = sleep
+
+    def sent_timestamp(self, monday: date) -> Optional[int]:
+        """Signal timestamp of the posted poll for a week, if known. Looks at
+        all of the week's lines: one resolved by hand ('<week> posted')
+        still has the timestamp on the line the bot wrote."""
+        key = week_key(monday)
+        if self.state.load().get(key, (None, ""))[0] != POSTED:
+            return None
+        found = None
+        for line in self.state.path.read_text().splitlines():
+            match = STATE_LINE.fullmatch(line.strip())
+            if match and match.group(1) == key and (ts := SENT_TIMESTAMP.search(match.group(3) or "")):
+                found = int(ts.group(1))
+        return found
 
     def plan(self, today: date) -> Tuple[List[date], List[str]]:
         """Return the weeks that need a poll, and descriptions of weeks whose
@@ -278,7 +294,9 @@ class PollManager:
             self.state.append(key, ERROR, error or f"an niemanden zugestellt: {failed}")
             return
 
-        self.state.append(key, POSTED, failed)
+        # Votes name their poll by this timestamp
+        sent = result.get("timestamp") if isinstance(result, dict) else None
+        self.state.append(key, POSTED, " ".join(filter(None, [f"ts={sent}" if sent else "", failed])))
         report.posted.append(week_label(monday))
         logger.info(f"Posted poll for {key}")
         if failed:

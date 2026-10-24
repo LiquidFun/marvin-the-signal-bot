@@ -2,25 +2,29 @@
 """
 Marvin - Signal bot for the kicker group
 
-    marvin.py chat             answer @-mentions (long-running; marvin.service)
+    marvin.py listen           record poll votes, answer @-mentions if enabled
+                               (long-running; marvin.service)
     marvin.py poll             post due availability polls, then exit
                                (oneshot; marvin-poll.timer)
-    marvin.py poll --dry-run   show what is due, send nothing
+    marvin.py offer            a week ahead, send the admin the "we have time"
+                               message for the captains (oneshot; marvin-offer.timer)
+    marvin.py poll|offer --dry-run   show what would happen, send nothing
 
 Polls run as a separate short-lived process on purpose: a restart or crash of
-the chat loop can never cause a poll to be posted.
+the listener can never cause a poll to be posted.
 """
 
 import argparse
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 import requests
 import yaml
 
 from modules import ChatHandler, PollManager, SignalClient
+from modules.offer import OfferManager, offer_text
 from modules.poll import PollReport, week_label
 
 logging.basicConfig(
@@ -103,12 +107,42 @@ def run_poll(config: dict, dry_run: bool) -> int:
     return 0 if ok else 1
 
 
+def run_offer(config: dict, dry_run: bool) -> int:
+    client = SignalClient(config)
+
+    if dry_run:
+        offers = OfferManager(client, config, PollManager(client, config))
+        today = date.today()
+        monday = today - timedelta(days=today.weekday()) + timedelta(weeks=1)
+        days, best, voters = offers.qualifying_days(monday)
+        print(f"{week_label(monday)}: {voters} people voted, most on one day: {best}")
+        if days is None:
+            print("No poll known for that week")
+        elif days:
+            print(offer_text(days, offers.template))
+        else:
+            print(f"No day has {offers.min_votes} votes, nothing would be sent")
+        return 0
+
+    try:
+        report = OfferManager(client, config, PollManager(client, config)).run()
+    except Exception as e:
+        logger.exception("Offer run crashed:")
+        report = PollReport(problems=[f"Captains-Nachricht abgestürzt: {e!r} (journalctl -u marvin-offer)"])
+
+    if report.ok:
+        return 0
+    notify_admin(client, config, "⚠️ Marvin braucht Hilfe:\n" + "\n".join(f"• {p}" for p in report.problems))
+    return 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="Marvin, the Signal kicker bot")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("chat", help="answer @-mentions (long-running)")
-    poll_parser = commands.add_parser("poll", help="post due polls, then exit")
-    poll_parser.add_argument("--dry-run", action="store_true", help="show what is due, send nothing")
+    commands.add_parser("listen", help="record poll votes, answer @-mentions (long-running)")
+    for name, summary in (("poll", "post due polls, then exit"), ("offer", "send next week's captains offer, then exit")):
+        sub = commands.add_parser(name, help=summary)
+        sub.add_argument("--dry-run", action="store_true", help="show what would happen, send nothing")
     args = parser.parse_args()
 
     config = load_config()
@@ -119,6 +153,8 @@ def main():
 
     if args.command == "poll":
         return run_poll(config, args.dry_run)
+    if args.command == "offer":
+        return run_offer(config, args.dry_run)
 
     if not config.get("bot_number"):
         logger.error("Please set bot_number in config.yaml or MARVIN_BOT_NUMBER env var")

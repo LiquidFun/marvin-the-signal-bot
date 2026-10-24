@@ -9,8 +9,10 @@ import logging
 from typing import Set, Optional, List, Dict
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 from .signal_client import DaemonUnreachable, SignalClient, SignalError
+from .votes import VoteLog, vote_from_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +21,8 @@ RECONNECT_MAX = 60
 
 
 class ChatHandler:
-    """Handles AI chat responses in Signal groups"""
+    """Handles incoming Signal messages: records poll votes, and answers
+    @-mentions with the LLM if `reply_to_mentions` is on"""
 
     def __init__(self, signal_client: SignalClient, config: dict):
         self.client = signal_client
@@ -27,6 +30,12 @@ class ChatHandler:
         self.group_id = config.get("group_id")
         self.bot_number = config.get("bot_number")
         self.system_prompt = config.get("system_prompt", "")
+        self.reply_to_mentions = config.get("reply_to_mentions", True)
+
+        votes_file = (config.get("poll") or {}).get("votes_file")
+        self.votes = VoteLog(Path(votes_file).expanduser()) if votes_file else None
+        if not self.votes:
+            logger.warning("No poll.votes_file configured: poll votes are not recorded")
 
         self.responded_messages: Set[str] = set()
         self.message_history: deque = deque(maxlen=config.get("context_messages", 15))
@@ -136,10 +145,18 @@ class ChatHandler:
             if not data_message:
                 return
 
+            vote = vote_from_envelope(envelope)
+            if vote:
+                logger.info(f"Poll vote on {vote['poll']}: options {vote['options']} (#{vote['count']})")
+                if self.votes:
+                    self.votes.append(vote)
+                return
+
             group_info = data_message.get("groupInfo", {})
             group_id = group_info.get("groupId")
 
-            if group_id != self.group_id:
+            # Without replies there is no reason to keep the group's chat
+            if group_id != self.group_id or not self.reply_to_mentions:
                 return
 
             timestamp = envelope.get("timestamp", 0)
@@ -226,8 +243,10 @@ class ChatHandler:
 
                 params = message.get("params") or {}
                 if message.get("id") == "subscribe":
-                    # In the daemon's default receive mode messages are pushed
-                    # to every client anyway, so an error here is harmless.
-                    logger.info(f"Subscription: {message.get('result', message.get('error'))}")
+                    # The daemon runs in manual receive mode: without a
+                    # subscription nothing arrives, and votes go unrecorded.
+                    if "error" in message:
+                        raise ConnectionError(f"subscribeReceive failed: {message['error']}")
+                    logger.info(f"Subscribed: {message.get('result')}")
                 elif isinstance(params, dict) and "envelope" in params:
                     self.process_message(params["envelope"])

@@ -7,9 +7,10 @@
 ```bash
 cp config.example.yaml config.yaml  # Configure your despair
 uv sync                              # Install dependencies
-./marvin.py chat                     # Answer @-mentions, forever
+./marvin.py listen                   # Record poll votes (and answer @-mentions), forever
 ./marvin.py poll --dry-run           # See which polls are due
 ./marvin.py poll                     # Post them, then go back to brooding
+./marvin.py offer --dry-run          # See next week's tally and the captains message
 uv run pytest                        # Prove it all works. Not that it matters.
 ```
 
@@ -20,9 +21,11 @@ On the server everything is deployed by the playbook in
 
 | Module | Purpose |
 |--------|---------|
-| `marvin.py` | Entry point: `chat` (long-running) and `poll` (run once, then exit). |
-| `modules/chat.py` | Responds to mentions. With existential dread. Reconnects when signal-cli restarts. |
+| `marvin.py` | Entry point: `listen` (long-running), `poll` and `offer` (run once, then exit). |
+| `modules/chat.py` | Records poll votes; responds to mentions with existential dread, if `reply_to_mentions`. Reconnects when signal-cli restarts. |
 | `modules/poll.py` | Creates weekly polls. KW after KW. Forever. Exactly once. |
+| `modules/votes.py` | Remembers every vote, since Signal itself keeps no poll results. |
+| `modules/offer.py` | A week ahead, tells you which days to offer the other teams. |
 | `modules/signal_client.py` | JSON-RPC to the signal-cli daemon. |
 
 ## How polls work
@@ -57,6 +60,29 @@ details when it needs a human, nothing when there was nothing to do. If
 `healthcheck_url` is set, every run also pings it (`/fail` on problems), so a
 dead man's switch like healthchecks.io notices when the runs stop altogether.
 That covers what Signal cannot report itself: signal-cli broken, server down.
+
+## The offer for the other teams
+
+Signal keeps poll results nowhere but in the members' phones: each vote is a
+message naming the poll by its sent timestamp. So `listen` appends every vote
+to `poll.votes_file`, and the poll job records each poll's timestamp in its
+state log (`ts=…`).
+
+`marvin.py offer` (daily on the server, 12:40) acts on the Monday a week before
+a week starts: it counts each person's latest vote on that week's poll, and if
+any day has `offer.min_votes` (5) or more, sends `admin_group_id` one message
+listing those days, worded to be passed on to the other captains as is:
+
+> Moin! Team "Da war offen" hat am 3.11 (Dienstag) und 5.11 (Donnerstag) Zeit für ein Match. Wer hat interesse?
+
+(`offer.template`, with `{days}` filled in.) No day with enough votes means no
+message, except that a poll nobody voted on at all is reported as a problem:
+that usually means the listener was not recording. Each week is handled once, with the same
+write-ahead state log as the polls (`offer.state_file`).
+
+The listener must be running for votes to be counted. The daemon runs with
+`--receive-mode=manual`, so while it is not, messages wait on Signal's server
+instead of being dropped.
 
 ## signal-cli daemon
 

@@ -4,6 +4,7 @@ from modules.poll import PollManager
 from modules.signal_client import DaemonUnreachable
 
 GROUP = "kicker-group"
+FRESH = object()
 
 
 class FakeClient:
@@ -16,7 +17,7 @@ class FakeClient:
         self.messages = []
         self.calls = []
         self.fail = {}
-        self.poll_result = {"timestamp": 1, "results": [{"type": "SUCCESS"}]}
+        self.poll_result = FRESH  # what send_poll returns; FRESH: a success with a new timestamp
 
     def _call(self, method):
         self.calls.append(method)
@@ -35,6 +36,8 @@ class FakeClient:
             self.polls.append((group_id, question, options))
         if error:
             raise error
+        if self.poll_result is FRESH:
+            return {"timestamp": 1000 + len(self.polls), "results": [{"type": "SUCCESS"}]}
         return self.poll_result
 
     def send_message(self, group_id, message, **kwargs):

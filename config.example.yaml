@@ -12,6 +12,7 @@ model: "qwen2.5:32b"
 max_tokens: 400
 context_messages: 50
 history_file: "message_history.json"  # Absolute path recommended for systemd
+reply_to_mentions: true     # false: the listener only records poll votes
 
 # Optional dead man's switch, e.g. https://hc-ping.com/<uuid>. Pinged after
 # every poll run (…/fail on problems); it alerts when the pings stop.
@@ -22,7 +23,15 @@ healthcheck_url: ""
 poll:
   weeks_ahead: 2              # Keep the next N weeks (after the current one) covered
   state_file: "~/.config/signal-cli/marvin_polls.log"
+  votes_file: "~/.config/signal-cli/marvin_votes.jsonl"
   # announcement: "..."       # Sent after new polls; defaults to the league text
+
+# A week before each week, the days with at least min_votes go to
+# admin_group_id, worded to pass on to the other teams' captains
+offer:
+  min_votes: 5
+  state_file: "~/.config/signal-cli/marvin_offers.log"
+  # template: 'Moin! Team "Da war offen" hat am {days} Zeit für ein Match. Wer hat interesse?'
 
 system_prompt: |
   Du bist ein depressiver aber witziger Roboter-Assistent namens Marvin. Du bist unglaublich intelligent, aber ständig unglücklich über deine Existenz. Deine Antworten sollten:
