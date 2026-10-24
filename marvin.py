@@ -22,7 +22,6 @@ import yaml
 
 from modules import ChatHandler, PollManager, SignalClient
 from modules.poll import PollReport, week_label
-from modules.signal_client import SignalError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,17 +48,19 @@ def load_config() -> dict:
     return config
 
 
-def notify_admin(client: SignalClient, config: dict, text: str):
-    """Tell the admin group what happened. Never raises."""
+def notify_admin(client: SignalClient, config: dict, text: str) -> bool:
+    """Tell the admin group what happened. Never raises; False if that failed."""
     logger.info(f"Report:\n{text}")
     admin_group_id = config.get("admin_group_id")
     if not admin_group_id:
         logger.warning("No admin_group_id configured, report not sent")
-        return
+        return False
     try:
         client.send_message(admin_group_id, text)
-    except SignalError as e:
-        logger.error(f"Could not send report to admin group: {e}")
+        return True
+    except Exception as e:
+        logger.error(f"Could not send report to admin group: {e!r}")
+        return False
 
 
 def ping_healthcheck(config: dict, ok: bool, text: str):
@@ -77,26 +78,29 @@ def ping_healthcheck(config: dict, ok: bool, text: str):
 
 def run_poll(config: dict, dry_run: bool) -> int:
     client = SignalClient(config)
-    manager = PollManager(client, config)
 
     if dry_run:
-        due, stuck = manager.plan(date.today())
+        due, stuck = PollManager(client, config).plan(date.today())
         print("Due:", ", ".join(week_label(monday) for monday in due) or "nothing")
         for problem in stuck:
             print("Needs attention:", problem)
         return 0
 
     try:
+        manager = PollManager(client, config)
         report = manager.run()
+        text = manager.summary(report)
     except Exception as e:
         logger.exception("Poll run crashed:")
-        report = PollReport(problems=[f"Absturz: {e!r} (journalctl -u marvin-poll)"])
+        report = PollReport(problems=[repr(e)])
+        text = f"⚠️ Marvin ist abgestürzt: {e!r}\nDetails: journalctl -u marvin-poll"
 
-    text = manager.summary(report)
-    if text:
-        notify_admin(client, config, text)
-    ping_healthcheck(config, report.ok, text or "nothing due")
-    return 0 if report.ok else 1
+    # A report that cannot be delivered is itself a problem: nobody knows
+    # what happened.
+    reported = notify_admin(client, config, text) if text else True
+    ok = report.ok and reported
+    ping_healthcheck(config, ok, text or "nothing due")
+    return 0 if ok else 1
 
 
 def main():

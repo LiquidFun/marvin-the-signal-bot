@@ -204,7 +204,7 @@ class TestUnreachableDaemon:
         report = pm.run(SAT)
         assert client.polls == []
         assert len(sleeps) == 2
-        assert any("nicht erreichbar" in p for p in report.problems)
+        assert any("nicht bereit" in p for p in report.problems)
         assert any(p.startswith("KW44") and "nicht gepostet" in p for p in report.problems)
 
         assert pm.run(SAT).ok
@@ -224,11 +224,19 @@ class TestPreflight:
         assert client.polls == []
         assert any("kennt die Gruppe nicht" in p for p in report.problems)
 
-    def test_list_groups_error_posts_nothing(self, pm, client):
-        client.fail["list_groups"] = [RpcError("listGroups", {"message": "boom"})]
-        report = pm.run(SAT)
+    @pytest.mark.parametrize("error", [RpcError("listGroups", {"message": "boom"}), NoResponse("closed")])
+    def test_list_groups_failure_is_retried(self, pm, client, sleeps, error):
+        """Read-only, so safe to retry; giving up would lose the whole day"""
+        client.fail["list_groups"] = [error]
+        assert pm.run(SAT).ok
+        assert questions(client) == ["KW44", "KW45"]
+        assert len(sleeps) == 1
+
+    def test_garbage_group_list_posts_nothing(self, make_pm, client):
+        client.groups = None
+        report = make_pm(connect_attempts=2).run(SAT)
         assert client.polls == []
-        assert not report.ok
+        assert any("unlesbar" in p for p in report.problems)
 
 
 class TestManualResolution:
@@ -270,3 +278,64 @@ class TestReporting:
         client.fail["send_poll"] = [NoResponse("timeout")]
         text = pm.summary(pm.run(MON))
         assert "⚠️" in text and "KW46" in text and str(pm.state.path) in text
+
+
+class TestStateLog:
+    def test_unparseable_line_is_fatal_not_skipped(self, pm, client):
+        """A skipped line would make its week look unposted"""
+        pm.state.path.write_text("# comment\n\n2026-W44 posted 2026-10-24T14:00:00+02:00\n2026-45 2026-01-01\n")
+        with pytest.raises(ValueError, match="polls.log:4"):
+            pm.run(SAT)
+        assert client.polls == []
+
+    def test_typo_in_status_is_fatal(self, pm):
+        pm.state.path.write_text("2026-W44 psoted\n")
+        with pytest.raises(ValueError):
+            pm.state.load()
+
+    def test_append_after_hand_edit_without_final_newline(self, pm):
+        pm.state.path.write_text("2026-W44 posted manual")
+        pm.state.append("2026-W45", "sending")
+        state = pm.state.load()
+        assert state["2026-W44"] == ("posted", "manual")
+        assert state["2026-W45"][0] == "sending"
+
+    def test_state_file_is_required(self, client):
+        for poll_config in ({}, None, {"weeks_ahead": 2}):
+            with pytest.raises(ValueError, match="state_file"):
+                PollManager(client, {"group_id": GROUP, "poll": poll_config})
+
+
+class TestDeliveryResults:
+    def test_failed_send_that_reached_part_of_the_group_counts_as_posted(self, pm, client):
+        response = {"timestamp": 1, "results": [{"type": "SUCCESS"}, {"type": "NETWORK_FAILURE"}]}
+        client.fail["send_poll"] = [RpcError("sendPollCreate", {"code": -3, "message": "x", "data": {"response": response}})]
+        report = pm.run(SAT)
+        assert report.ok
+        assert len(report.posted) == 2
+        assert "1/2 (NETWORK_FAILURE)" in report.notes[0]
+
+    def test_failed_send_without_any_success_is_an_error(self, pm, client):
+        response = {"results": [{"type": "NETWORK_FAILURE"}]}
+        client.fail["send_poll"] = [RpcError("sendPollCreate", {"message": "x", "data": {"response": response}})]
+        report = pm.run(SAT)
+        assert any(p.startswith("KW44") and "error" in p for p in report.problems)
+
+    def test_success_that_reached_nobody_is_an_error(self, pm, client):
+        client.poll_result = {"results": [{"type": "NETWORK_FAILURE"}, {"type": "UNREGISTERED_FAILURE"}]}
+        report = pm.run(SAT)
+        assert report.posted == []
+        assert any("niemanden" in p for p in report.problems)
+        pm.run(SAT)
+        assert len(client.polls) == 2  # still not retried
+
+    @pytest.mark.parametrize("result", [None, {}, {"results": None}, {"results": ["x", None]}, []])
+    def test_odd_result_shapes_count_as_posted(self, pm, client, result):
+        client.poll_result = result
+        assert pm.run(SAT).ok
+        assert [line.split()[1] for line in state_lines(pm)][-1] == "posted"
+
+
+def test_hand_edited_lines_may_use_any_whitespace(pm):
+    pm.state.path.write_text("2026-W44\tposted\n2026-W45  posted   by hand  \n")
+    assert pm.state.load() == {"2026-W44": ("posted", ""), "2026-W45": ("posted", "by hand")}

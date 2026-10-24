@@ -49,6 +49,9 @@ delivered it, so the week is **not retried**. Instead Marvin reports it to
 - it is missing: delete the week's lines and run `marvin.py poll`
   (on the server: `systemctl start marvin-poll`).
 
+A line Marvin cannot parse stops the run (and is reported) instead of being
+skipped, since a skipped week would look unposted and go out again.
+
 Each run reports to `admin_group_id`: ✅ when it posted something, ⚠️ with
 details when it needs a human, nothing when there was nothing to do. If
 `healthcheck_url` is set, every run also pings it (`/fail` on problems), so a

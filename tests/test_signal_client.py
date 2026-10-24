@@ -4,6 +4,7 @@ of failure."""
 import json
 import socket
 import threading
+import time
 
 import pytest
 
@@ -125,3 +126,36 @@ def test_send_poll_request(daemon_with):
     request = daemon.requests[0]
     assert request["method"] == "sendPollCreate"
     assert request["params"] == {"groupId": "grp", "question": "KW44", "options": ["a", "b"]}
+
+
+def test_notification_stream_does_not_extend_the_deadline(daemon_with):
+    stop = threading.Event()
+
+    def handler(conn, request):
+        while not stop.wait(0.05):
+            reply(conn, notification())
+
+    daemon = daemon_with(handler)
+    start = time.monotonic()
+    try:
+        with pytest.raises(NoResponse):
+            daemon.client(daemon_timeout=0.3).call("send")
+    finally:
+        stop.set()
+    assert time.monotonic() - start < 1
+
+
+def test_non_object_lines_are_skipped(daemon_with):
+    def handler(conn, request):
+        conn.sendall(b'[1, 2]\n"text"\nnull\n')
+        reply(conn, {"jsonrpc": "2.0", "id": request["id"], "result": "ok"})
+
+    assert daemon_with(handler).client().call("send") == "ok"
+
+
+def test_error_that_is_not_an_object(daemon_with):
+    def handler(conn, request):
+        reply(conn, {"jsonrpc": "2.0", "id": request["id"], "error": "weird"})
+
+    with pytest.raises(RpcError, match="weird"):
+        daemon_with(handler).client().call("send")

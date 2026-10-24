@@ -16,6 +16,7 @@ are reported as problems instead, for a human to resolve.
 import fcntl
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from .signal_client import DaemonUnreachable, SignalClient, SignalError
+from .signal_client import DaemonUnreachable, RpcError, SignalClient, SignalError
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +61,21 @@ def upcoming_mondays(today: date, weeks_ahead: int) -> List[date]:
     return [this_monday + timedelta(weeks=i) for i in range(1, weeks_ahead + 1)]
 
 
-def undelivered(result) -> str:
-    """Summarise recipients signal-cli reported as failed, e.g. '1/14 (UNREGISTERED_FAILURE)'"""
-    results = result.get("results", []) if isinstance(result, dict) else []
-    failed = [r.get("type") for r in results if r.get("type") != "SUCCESS"]
+def recipient_results(result) -> List[dict]:
+    """Per-recipient outcomes in a send result, e.g. [{"type": "SUCCESS", ...}]"""
+    results = result.get("results") if isinstance(result, dict) else None
+    return [r for r in results if isinstance(r, dict)] if isinstance(results, list) else []
+
+
+def undelivered(results: List[dict]) -> str:
+    """Summarise failed recipients, e.g. '1/14 (UNREGISTERED_FAILURE)'"""
+    failed = [str(r.get("type")) for r in results if r.get("type") != "SUCCESS"]
     if not failed:
         return ""
-    return f"{len(failed)}/{len(results)} ({', '.join(sorted(set(map(str, failed))))})"
+    return f"{len(failed)}/{len(results)} ({', '.join(sorted(set(failed)))})"
+
+
+STATE_LINE = re.compile(r"(\d{4}-W\d{2})\s+(posted|sending|unsent|error)(?:\s+(.*))?")
 
 
 class StateLog:
@@ -82,23 +91,34 @@ class StateLog:
     def load(self) -> Dict[str, Tuple[str, str]]:
         """Return {week: (status, rest of line)}.
 
-        Raises if the file is unreadable: treating it as empty would repost
-        every week.
+        Raises on anything it does not understand, rather than skip it: a
+        week whose line was skipped would look unposted and be posted again.
         """
         state = {}
         if self.path.exists():
-            for line in self.path.read_text().splitlines():
-                parts = line.split(maxsplit=2)
-                if len(parts) >= 2 and not line.startswith("#"):
-                    state[parts[0]] = (parts[1], parts[2] if len(parts) > 2 else "")
+            for number, line in enumerate(self.path.read_text().splitlines(), 1):
+                if not line.strip() or line.startswith("#"):
+                    continue
+                match = STATE_LINE.fullmatch(line.strip())
+                if not match:
+                    raise ValueError(f"{self.path}:{number}: cannot parse {line!r}")
+                week, status, detail = match.groups()
+                state[week] = (status, detail or "")
         return state
 
     def append(self, week: str, status: str, detail: str = ""):
         line = f"{week} {status} {datetime.now().astimezone().isoformat(timespec='seconds')}"
         if detail:
             line += " " + " ".join(detail.split())
-        with open(self.path, "a") as f:
-            f.write(line + "\n")
+        with open(self.path, "ab+") as f:
+            end = f.seek(0, os.SEEK_END)
+            if end:
+                f.seek(end - 1)
+                if f.read(1) != b"\n":
+                    # A hand edit without a final newline would otherwise
+                    # swallow this line into its own.
+                    line = "\n" + line
+            f.write(line.encode() + b"\n")
             f.flush()
             os.fsync(f.fileno())
 
@@ -112,7 +132,11 @@ class StateLog:
 
 
 class PreflightError(Exception):
-    """Posting is pointless right now, e.g. the bot is not in the group"""
+    """Posting is pointless, e.g. the bot is not in the group"""
+
+
+class NotReady(Exception):
+    """signal-cli cannot be used right now, and nothing was sent: retry"""
 
 
 @dataclass
@@ -135,14 +159,18 @@ class PollManager:
         config: dict,
         sleep: Callable[[float], None] = time.sleep,
     ):
-        poll_config = config.get("poll", {})
+        poll_config = config.get("poll") or {}
+        if not poll_config.get("state_file"):
+            # No default: a relative or per-user fallback would be an empty
+            # log the moment the bot runs from elsewhere, and repost everything.
+            raise ValueError("poll.state_file must be set")
         self.client = signal_client
         self.group_id = config["group_id"]
         self.weeks_ahead = poll_config.get("weeks_ahead", 2)
         self.announcement = poll_config.get("announcement", DEFAULT_ANNOUNCEMENT)
         self.attempts = poll_config.get("connect_attempts", 5)
         self.retry_delay = poll_config.get("retry_delay", 60)
-        self.state = StateLog(Path(poll_config.get("state_file", "poll_state.log")).expanduser())
+        self.state = StateLog(Path(poll_config["state_file"]).expanduser())
         self.sleep = sleep
 
     def plan(self, today: date) -> Tuple[List[date], List[str]]:
@@ -168,10 +196,10 @@ class PollManager:
                 try:
                     self._post_due(today, report)
                     break
-                except DaemonUnreachable as e:
-                    logger.warning(f"signal-cli unreachable (attempt {attempt}/{self.attempts}): {e}")
+                except (DaemonUnreachable, NotReady) as e:
+                    logger.warning(f"signal-cli not ready (attempt {attempt}/{self.attempts}): {e}")
                     if attempt == self.attempts:
-                        report.problems.append(f"signal-cli nicht erreichbar: {e}")
+                        report.problems.append(f"signal-cli nicht bereit: {e}")
                     else:
                         self.sleep(self.retry_delay)
                 except PreflightError as e:
@@ -211,9 +239,12 @@ class PollManager:
         except DaemonUnreachable:
             raise
         except SignalError as e:
-            raise PreflightError(f"Gruppenliste nicht abrufbar: {e}") from e
+            # Read-only, so any failure is safe to retry
+            raise NotReady(f"Gruppenliste nicht abrufbar: {e}") from e
 
-        group = next((g for g in groups if g.get("id") == self.group_id), None)
+        if not isinstance(groups, list):
+            raise NotReady(f"Gruppenliste unlesbar: {str(groups)[:100]}")
+        group = next((g for g in groups if isinstance(g, dict) and g.get("id") == self.group_id), None)
         if group is None:
             raise PreflightError("Bot kennt die Gruppe nicht (group_id falsch?)")
         if not group.get("isMember", True):
@@ -225,17 +256,28 @@ class PollManager:
         options.append("Keine Zeit :(")
 
         self.state.append(key, SENDING)
+        error = None
         try:
             result = self.client.send_poll(self.group_id, f"KW{monday.isocalendar()[1]}", options)
         except DaemonUnreachable:
             self.state.append(key, UNSENT)
             raise
+        except RpcError as e:
+            # signal-cli can fail a send that still reached part of the group,
+            # in which case the poll is there and must count as posted
+            result = e.data.get("response") if isinstance(e.data, dict) else None
+            error = str(e)
         except SignalError as e:
-            logger.error(f"Poll for {key} may or may not have been sent: {e}")
-            self.state.append(key, ERROR, str(e))
+            result, error = None, str(e)
+
+        results = recipient_results(result)
+        failed = undelivered(results)
+        delivered = any(r.get("type") == "SUCCESS" for r in results)
+        if not delivered and (error or results):
+            logger.error(f"Poll for {key} may or may not have been sent: {error or failed}")
+            self.state.append(key, ERROR, error or f"an niemanden zugestellt: {failed}")
             return
 
-        failed = undelivered(result)
         self.state.append(key, POSTED, failed)
         report.posted.append(week_label(monday))
         logger.info(f"Posted poll for {key}")

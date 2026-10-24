@@ -91,3 +91,18 @@ def test_chat_reconnects_with_backoff(client, config, monkeypatch):
         ChatHandler(client, config).run()
     assert len(attempts) == 6
     assert delays == [5, 10, 20, 40, 60, 60]
+
+
+def test_undeliverable_report_fails_the_unit(run, client):
+    client.fail["send_message"] = [None, NoResponse("timeout")]  # announcement ok, report not
+    code, pings = run()
+    assert code == 1
+    assert pings == ["https://hc.example/abc/fail"]
+
+
+def test_broken_config_still_alerts(run, client, config):
+    config["poll"] = None
+    code, pings = run()
+    assert code == 1
+    assert "state_file" in admin_messages(client)[0]
+    assert pings == ["https://hc.example/abc/fail"]

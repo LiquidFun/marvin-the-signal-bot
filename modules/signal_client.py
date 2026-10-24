@@ -13,6 +13,7 @@ because that decides whether retrying can produce a duplicate:
 import json
 import logging
 import socket
+import time
 import uuid
 from typing import List, Optional
 
@@ -36,8 +37,12 @@ class NoResponse(SignalError):
 class RpcError(SignalError):
     """The daemon answered with a JSON-RPC error."""
 
-    def __init__(self, method: str, error: dict):
+    def __init__(self, method: str, error):
+        if not isinstance(error, dict):
+            error = {"message": str(error)}
         self.code = error.get("code")
+        # For a failed send this may hold the per-recipient results
+        self.data = error.get("data")
         super().__init__(f"{method}: {error.get('message', error)} (code {self.code})")
 
 
@@ -82,20 +87,28 @@ class SignalClient:
             raise RpcError(method, response["error"])
         return response.get("result")
 
-    @staticmethod
-    def _read_response(sock: socket.socket, request_id: str) -> Optional[dict]:
+    def _read_response(self, sock: socket.socket, request_id: str) -> Optional[dict]:
+        # One deadline for the whole call: a stream of notifications must not
+        # keep resetting a per-recv timeout while the response never comes.
+        deadline = time.monotonic() + self.timeout
         buf = b""
-        while chunk := sock.recv(65536):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"no response within {self.timeout}s")
+            sock.settimeout(remaining)
+            chunk = sock.recv(65536)
+            if not chunk:
+                return None
             buf += chunk
             *lines, buf = buf.split(b"\n")
             for line in lines:
                 if not line.strip():
                     continue
                 msg = json.loads(line)
-                if msg.get("id") == request_id:
+                if isinstance(msg, dict) and msg.get("id") == request_id:
                     return msg
-                logger.debug(f"Skipping unsolicited message: {msg.get('method', '?')}")
-        return None
+                logger.debug(f"Skipping unsolicited message: {str(msg)[:100]}")
 
     def send_message(
         self,
@@ -123,8 +136,12 @@ class SignalClient:
         """Open a connection subscribed to incoming messages. Blocks on reads
         indefinitely: the daemon sends nothing while the group is quiet."""
         sock = self.connect()
-        sock.settimeout(None)
-        request = {"jsonrpc": "2.0", "method": "subscribeReceive", "params": {}, "id": "subscribe"}
-        sock.sendall(json.dumps(request).encode() + b"\n")
+        try:
+            sock.settimeout(None)
+            request = {"jsonrpc": "2.0", "method": "subscribeReceive", "params": {}, "id": "subscribe"}
+            sock.sendall(json.dumps(request).encode() + b"\n")
+        except BaseException:
+            sock.close()
+            raise
         logger.info("Connected to signal-cli daemon")
         return sock
