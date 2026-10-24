@@ -1,31 +1,28 @@
-group_id: "<group_id>"
+group_id: "<group_id>"             # the kicker group: polls and @-mention replies
+admin_group_id: "<group_id>"       # where Marvin reports what it posted and what went wrong
 bot_number: "+4901234567890"
 
 daemon_host: "127.0.0.1"
 daemon_port: 7583
 
-llm_url: "http://localhost:8091/v1/chat/completions"
-model: "./models/Qwen2.5-32B-Instruct-AWQ"
+# Any OpenAI-compatible chat endpoint, e.g. Ollama
+llm_url: "http://localhost:11434/v1/chat/completions"
+model: "qwen2.5:32b"
 
 max_tokens: 400
 context_messages: 50
+history_file: "message_history.json"  # Absolute path recommended for systemd
 
-kicker_site:
-  url: ""
-  group_id: 1
-  username: Marvin
-  password: ""
+# Optional dead man's switch, e.g. https://hc-ping.com/<uuid>. Pinged after
+# every poll run (…/fail on problems); it alerts when the pings stop.
+healthcheck_url: ""
 
-# Poll settings
+# Poll settings. *When* polls are checked is up to whatever runs
+# `marvin.py poll` (on the server: marvin-poll.timer, daily at 12:30).
 poll:
-  enabled: true
-  schedule: "12:30"           # Time to check polls (24h format)
-  schedule_days: [0,1,2,3,4]  # Weekdays only (Mon=0, Tue=1, ..., Sun=6)
-  weeks_ahead: 3              # Ensure this many weeks are covered
-  post_count: 2               # Post this many polls at a time
-  state_file: "~/.config/signal-cli/signal_poll_weeks.json"
-  check_on_startup: true      # Check and post polls when bot starts
-  poll_prompt: "Schreibe eine kurze Ankündigung für die Kicker-Umfrage KW{week}."  # LLM prompt (uses system_prompt)
+  weeks_ahead: 2              # Keep the next N weeks (after the current one) covered
+  state_file: "~/.config/signal-cli/marvin_polls.log"
+  # announcement: "..."       # Sent after new polls; defaults to the league text
 
 system_prompt: |
   Du bist ein depressiver aber witziger Roboter-Assistent namens Marvin. Du bist unglaublich intelligent, aber ständig unglücklich über deine Existenz. Deine Antworten sollten:

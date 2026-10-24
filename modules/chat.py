@@ -10,9 +10,12 @@ from typing import Set, Optional, List, Dict
 from collections import deque
 from datetime import datetime
 
-from .signal_client import SignalClient
+from .signal_client import DaemonUnreachable, SignalClient, SignalError
 
 logger = logging.getLogger(__name__)
+
+RECONNECT_MIN = 5
+RECONNECT_MAX = 60
 
 
 class ChatHandler:
@@ -81,7 +84,11 @@ class ChatHandler:
                 "max_tokens": self.config.get("max_tokens", 200)
             }
 
-            response = requests.post(self.config["llm_url"], json=payload, timeout=30)
+            # Generous: the LLM runs on another machine and may have to load
+            # the model into VRAM first.
+            response = requests.post(
+                self.config["llm_url"], json=payload, timeout=self.config.get("llm_timeout", 180)
+            )
             response.raise_for_status()
             result = response.json()
             return result["choices"][0]["message"]["content"].strip()
@@ -160,12 +167,16 @@ class ChatHandler:
             llm_response = self.get_llm_response(message_text, context)
 
             quote_author = envelope.get("sourceNumber") or envelope.get("source")
-            self.client.send_message(
-                group_id,
-                llm_response,
-                quote_timestamp=timestamp,
-                quote_author=quote_author
-            )
+            try:
+                self.client.send_message(
+                    group_id,
+                    llm_response,
+                    quote_timestamp=timestamp,
+                    quote_author=quote_author
+                )
+            except SignalError as e:
+                logger.error(f"Failed to send reply: {e}")
+                return
 
             self.add_to_history("Marvin", llm_response, int(time.time() * 1000))
             self.responded_messages.add(message_id)
@@ -178,53 +189,45 @@ class ChatHandler:
             logger.exception("Error processing message:")
 
     def run(self):
-        """Main loop - listen for messages and run scheduler"""
-        logger.info("=" * 60)
-        logger.info("Marvin Bot Starting")
-        logger.info(f"Group: {self.group_id}")
-        logger.info(f"Bot: {self.bot_number}")
-        logger.info(f"LLM: {self.config['llm_url']}")
-        logger.info("=" * 60)
+        """Listen for messages forever, reconnecting whenever the daemon goes
+        away (it restarts on every signal-cli image update)"""
+        logger.info(f"Marvin listening in group {self.group_id} as {self.bot_number}, LLM: {self.config['llm_url']}")
 
-        try:
-            sock = self.client.create_subscription_socket()
-            buffer = b''
-
-            while True:
-                try:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        logger.warning("Connection closed by daemon")
-                        break
-
-                    buffer += chunk
-
-                    while b'\n' in buffer:
-                        line, buffer = buffer.split(b'\n', 1)
-                        if line.strip():
-                            try:
-                                message = json.loads(line.decode())
-
-                                if message.get("id") == "subscribe":
-                                    logger.info("Subscription confirmed")
-                                    continue
-
-                                if "params" in message and "envelope" in message["params"]:
-                                    envelope = message["params"]["envelope"]
-                                    self.process_message(envelope)
-
-                            except json.JSONDecodeError:
-                                logger.warning(f"Failed to parse JSON: {line[:100]}")
-
-                except Exception:
-                    logger.exception("Error receiving message:")
-
-        except KeyboardInterrupt:
-            logger.info("Shutdown requested...")
-        except Exception:
-            logger.exception("Fatal error:")
-        finally:
+        delay = RECONNECT_MIN
+        while True:
             try:
-                sock.close()
-            except:
-                pass
+                with self.client.subscribe() as sock:
+                    delay = RECONNECT_MIN
+                    self.listen(sock)
+                logger.warning("Connection closed by daemon")
+            except DaemonUnreachable as e:
+                logger.warning(f"signal-cli unreachable: {e}")
+            except OSError:
+                logger.exception("Lost connection to signal-cli:")
+
+            logger.info(f"Reconnecting in {delay}s")
+            time.sleep(delay)
+            delay = min(delay * 2, RECONNECT_MAX)
+
+    def listen(self, sock):
+        """Handle incoming messages until the connection closes"""
+        buffer = b''
+        while chunk := sock.recv(65536):
+            buffer += chunk
+            *lines, buffer = buffer.split(b'\n')
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    logger.warning(f"Failed to parse JSON: {line[:100]}")
+                    continue
+
+                params = message.get("params") or {}
+                if message.get("id") == "subscribe":
+                    # In the daemon's default receive mode messages are pushed
+                    # to every client anyway, so an error here is harmless.
+                    logger.info(f"Subscription: {message.get('result', message.get('error'))}")
+                elif isinstance(params, dict) and "envelope" in params:
+                    self.process_message(params["envelope"])

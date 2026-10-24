@@ -1,19 +1,28 @@
-#!/usr/bin/env -S uv run --script --with schedule
+#!/usr/bin/env -S uv run
 """
-Marvin - Signal Bot Orchestrator
-Coordinates chat responses and poll scheduling
+Marvin - Signal bot for the kicker group
+
+    marvin.py chat             answer @-mentions (long-running; marvin.service)
+    marvin.py poll             post due availability polls, then exit
+                               (oneshot; marvin-poll.timer)
+    marvin.py poll --dry-run   show what is due, send nothing
+
+Polls run as a separate short-lived process on purpose: a restart or crash of
+the chat loop can never cause a poll to be posted.
 """
 
-import os
-import time
-import threading
+import argparse
 import logging
-from datetime import datetime
+import os
+import sys
+from datetime import date
 
+import requests
 import yaml
-import schedule
 
-from modules import SignalClient, ChatHandler, PollManager
+from modules import ChatHandler, PollManager, SignalClient
+from modules.poll import PollReport, week_label
+from modules.signal_client import SignalError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,10 +32,13 @@ logger = logging.getLogger(__name__)
 
 
 def load_config() -> dict:
-    """Load configuration from YAML file"""
-    config_path = os.environ.get("MARVIN_CONFIG", "config.yaml")
+    """Load configuration from YAML file: $MARVIN_CONFIG, else the systemd
+    credential `config.yaml` (LoadCredential=), else ./config.yaml"""
+    config_path = os.environ.get("MARVIN_CONFIG")
+    if not config_path and os.environ.get("CREDENTIALS_DIRECTORY"):
+        config_path = os.path.join(os.environ["CREDENTIALS_DIRECTORY"], "config.yaml")
 
-    with open(config_path, 'r') as f:
+    with open(config_path or "config.yaml", 'r') as f:
         config = yaml.safe_load(f)
 
     if os.environ.get("MARVIN_SIGNAL_GROUP_ID"):
@@ -37,65 +49,80 @@ def load_config() -> dict:
     return config
 
 
-def setup_scheduler(poll_manager: PollManager, config: dict):
-    """Configure poll scheduling based on config"""
-    poll_config = config.get("poll", {})
-
-    if not poll_config.get("enabled", True):
-        logger.info("Poll scheduling disabled")
+def notify_admin(client: SignalClient, config: dict, text: str):
+    """Tell the admin group what happened. Never raises."""
+    logger.info(f"Report:\n{text}")
+    admin_group_id = config.get("admin_group_id")
+    if not admin_group_id:
+        logger.warning("No admin_group_id configured, report not sent")
         return
-
-    schedule_time = poll_config.get("schedule", "12:30")
-    schedule_days = poll_config.get("schedule_days", [0, 1, 2, 3, 4])
-
-    day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-
-    for day_num in schedule_days:
-        if 0 <= day_num <= 6:
-            day_name = day_names[day_num]
-            job = getattr(schedule.every(), day_name)
-            job.at(schedule_time).do(poll_manager.check_and_post_polls)
-            logger.info(f"Scheduled poll check: {day_name.capitalize()} at {schedule_time}")
+    try:
+        client.send_message(admin_group_id, text)
+    except SignalError as e:
+        logger.error(f"Could not send report to admin group: {e}")
 
 
-def run_scheduler():
-    """Background thread to run scheduled tasks"""
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+def ping_healthcheck(config: dict, ok: bool, text: str):
+    """Ping a dead man's switch (e.g. healthchecks.io), if configured. It
+    raises the alarm when pings stop, which covers the cases Signal cannot
+    report itself: signal-cli broken, server down. Never raises."""
+    url = config.get("healthcheck_url")
+    if not url:
+        return
+    try:
+        requests.post(url if ok else url.rstrip("/") + "/fail", data=text.encode(), timeout=10)
+    except requests.RequestException as e:
+        logger.warning(f"Healthcheck ping failed: {e}")
+
+
+def run_poll(config: dict, dry_run: bool) -> int:
+    client = SignalClient(config)
+    manager = PollManager(client, config)
+
+    if dry_run:
+        due, stuck = manager.plan(date.today())
+        print("Due:", ", ".join(week_label(monday) for monday in due) or "nothing")
+        for problem in stuck:
+            print("Needs attention:", problem)
+        return 0
+
+    try:
+        report = manager.run()
+    except Exception as e:
+        logger.exception("Poll run crashed:")
+        report = PollReport(problems=[f"Absturz: {e!r} (journalctl -u marvin-poll)"])
+
+    text = manager.summary(report)
+    if text:
+        notify_admin(client, config, text)
+    ping_healthcheck(config, report.ok, text or "nothing due")
+    return 0 if report.ok else 1
 
 
 def main():
-    """Main entry point"""
+    parser = argparse.ArgumentParser(description="Marvin, the Signal kicker bot")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("chat", help="answer @-mentions (long-running)")
+    poll_parser = commands.add_parser("poll", help="post due polls, then exit")
+    poll_parser.add_argument("--dry-run", action="store_true", help="show what is due, send nothing")
+    args = parser.parse_args()
+
     config = load_config()
 
     if not config.get("group_id"):
         logger.error("Please set group_id in config.yaml or MARVIN_SIGNAL_GROUP_ID env var")
         return 1
 
+    if args.command == "poll":
+        return run_poll(config, args.dry_run)
+
     if not config.get("bot_number"):
         logger.error("Please set bot_number in config.yaml or MARVIN_BOT_NUMBER env var")
         return 1
 
-    signal_client = SignalClient(config)
-    chat_handler = ChatHandler(signal_client, config)
-    poll_manager = PollManager(signal_client, config, chat_handler)
-
-    setup_scheduler(poll_manager, config)
-
-    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
-    logger.info("Scheduler thread started")
-
-    poll_config = config.get("poll", {})
-    if poll_config.get("check_on_startup", True):
-        logger.info("Running initial poll check...")
-        poll_manager.check_and_post_polls()
-
-    chat_handler.run()
-
+    ChatHandler(SignalClient(config), config).run()
     return 0
 
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
